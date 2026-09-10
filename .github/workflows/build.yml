@@ -3,8 +3,10 @@ name: Build APK
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
   release:
-    types: [ created ]
+    types: [ published, created ]
   workflow_dispatch:
 
 permissions:
@@ -12,48 +14,69 @@ permissions:
 
 jobs:
   build:
+    name: Build & Package APK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-java@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          
+          cache: 'gradle'
+
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        
-      - name: Generate gradlew
-        run: gradle wrapper --gradle-version 8.2
-        
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure Gradle Wrapper
+        run: |
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper --gradle-version 8.2
+          fi
+          chmod +x gradlew
+
       - name: Build Release APK
-        run: ./gradlew assembleRelease
-        
-      - name: Prepare for release 
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Sign and Align APK
         env:
           KEYSTORE_B64: ${{ secrets.SIGNING_KEY }}
           KEYSTORE_PASS: ${{ secrets.KEY_STORE_PASSWORD }}
           ALIAS: ${{ secrets.ALIAS }}
           KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$KEYSTORE_B64" | base64 --decode > my.keystore
-          
           BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
           
-          $BUILD_TOOLS_DIR/zipalign -v -p 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
-          
-          $BUILD_TOOLS_DIR/apksigner sign --ks my.keystore --ks-pass env:KEYSTORE_PASS --ks-key-alias "$ALIAS" --key-pass env:KEY_PASS --out ForceSystemFont.apk aligned.apk
-          
-      - name: Upload Artifact
+          if [ ! -f "$UNSIGNED_APK" ]; then
+            echo "Error: Release APK was not found at $UNSIGNED_APK"
+            exit 1
+          fi
+
+          $BUILD_TOOLS_DIR/zipalign -v -p 4 "$UNSIGNED_APK" aligned.apk
+
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$ALIAS" ] && [ -n "$KEY_PASS" ]; then
+            echo "Signing with repository production keystore..."
+            echo "$KEYSTORE_B64" | base64 --decode > my.keystore
+            $BUILD_TOOLS_DIR/apksigner sign --ks my.keystore --ks-pass env:KEYSTORE_PASS --ks-key-alias "$ALIAS" --key-pass env:KEY_PASS --out ForceSystemFont.apk aligned.apk
+          else
+            echo "Warning: Repository signing secrets not detected. Signing with test keystore for installable output..."
+            keytool -genkey -v -keystore test.keystore -alias android -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=Android,C=US"
+            $BUILD_TOOLS_DIR/apksigner sign --ks test.keystore --ks-pass pass:android --ks-key-alias android --key-pass pass:android --out ForceSystemFont.apk aligned.apk
+          fi
+
+      - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ForceSystemFont-Release
           path: ForceSystemFont.apk
-          
-      - name: Upload to GitHub Release
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: ForceSystemFont.apk
         env:
